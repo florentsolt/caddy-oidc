@@ -2,6 +2,7 @@ package caddyoidc
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -66,7 +67,7 @@ func (hasIdentity *HasIdentity) Match(r *http.Request) bool {
 	}
 	buf := new(bytes.Buffer)
 	json.NewEncoder(buf).Encode(session.UserInfo)
-	repl.Set("oidc.userinfo", buf.String())
+	repl.Set("oidc.userinfo", base64.StdEncoding.EncodeToString(buf.Bytes()))
 	repl.Set("oidc.authorization", session.Token.Type()+" "+session.Token.AccessToken)
 	return true
 }
