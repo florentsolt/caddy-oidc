@@ -1,0 +1,57 @@
+{
+    order oidc first 
+}
+
+:8000 {
+    encode zstd gzip
+
+    log {
+        output stdout
+        format console
+        level error
+    }
+
+    @identified {
+        path /*
+        has_identity
+    }
+
+    @isflorent {
+        expression {oidc.userinfo.email} == 'florent.solt@gmail.com'
+    }
+
+    handle /auth/* {
+        # /auth/login 
+        # /auth/logout 
+        # /auth/callback 
+
+        oidc {
+            client_id 115265533744-676e39ua99pnu896pjkcrfacab7qbdp7.apps.googleusercontent.com
+            client_secret 9RkkZGgfKwCTfs5aQG1h2tLO
+            scopes openid profile email
+            provider https://accounts.google.com
+        }
+    }
+
+    handle @identified {
+        request_header X-Auth-Header {oidc.authorization}
+        request_header X-Auth-User-Info {oidc.userinfo}
+
+        handle @isflorent {
+
+            handle /private {
+                respond "Hello {oidc.userinfo}"
+            }
+
+        }
+
+    }
+
+    handle /public {
+        respond "Hello, world!"
+    }
+
+    handle /* {
+        redir * /auth/login?redirect={http.request.uri}
+    }
+}
