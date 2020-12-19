@@ -56,6 +56,7 @@ type Provider struct {
 	LogoutPath         string    `json:"logout_path"`
 	CallbackPath       string    `json:"callback_path"`
 	LogoutRedirect     string    `json:"logout_redirect"`
+	DefaultRoot        string    `json:"default_root"`
 
 	logger      *zap.Logger
 	oAuthConfig *oauth2.Config
@@ -105,10 +106,21 @@ func (provider *Provider) Provision(ctx caddy.Context) error {
 		return ErrUnableToGetProviderConfig
 	}
 
-	provider.LoginPath = "{http.request.uri.path.dir}login"
-	provider.LogoutPath = "{http.request.uri.path.dir}logout"
-	provider.CallbackPath = "{http.request.uri.path.dir}callback"
-	provider.LogoutRedirect = "{http.request.scheme}://{http.request.hostport}{http.request.uri.path.dir}login"
+	if provider.LoginPath == "" {
+		provider.LoginPath = "{http.request.uri.path.dir}login"
+	}
+	if provider.LogoutPath == "" {
+		provider.LogoutPath = "{http.request.uri.path.dir}logout"
+	}
+	if provider.CallbackPath == "" {
+		provider.CallbackPath = "{http.request.uri.path.dir}callback"
+	}
+	if provider.LogoutRedirect == "" {
+		provider.LogoutRedirect = "{http.request.scheme}://{http.request.hostport}{http.request.uri.path.dir}login"
+	}
+	if provider.DefaultRoot == "" {
+		provider.DefaultRoot = "{http.request.scheme}://{http.request.hostport}"
+	}
 
 	if provider.CookiePath == "" {
 		provider.CookiePath = "/"
@@ -176,6 +188,26 @@ func (provider *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			case "provider":
 				if !d.Args(&provider.URL) {
+					return d.ArgErr()
+				}
+			case "login_path":
+				if !d.Args(&provider.LoginPath) {
+					return d.ArgErr()
+				}
+			case "logout_path":
+				if !d.Args(&provider.LogoutPath) {
+					return d.ArgErr()
+				}
+			case "callback_path":
+				if !d.Args(&provider.CallbackPath) {
+					return d.ArgErr()
+				}
+			case "logout_redirect":
+				if !d.Args(&provider.LogoutRedirect) {
+					return d.ArgErr()
+				}
+			case "default_root":
+				if !d.Args(&provider.DefaultRoot) {
 					return d.ArgErr()
 				}
 			case "cookie_path":
@@ -379,7 +411,7 @@ func (provider *Provider) Login(w http.ResponseWriter, r *http.Request) error {
 	} else if r.Referer() != "" {
 		redirect = r.Referer()
 	} else {
-		redirect = repl.ReplaceKnown("{http.request.scheme}://{http.request.hostport}", "")
+		redirect = repl.ReplaceKnown(provider.DefaultRoot, "")
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:    provider.CookieNameRedirect,
@@ -388,7 +420,7 @@ func (provider *Provider) Login(w http.ResponseWriter, r *http.Request) error {
 		Expires: expiration,
 	})
 	provider.oAuthConfig.RedirectURL = repl.ReplaceKnown(
-		"{http.request.scheme}://{http.request.hostport}"+provider.CallbackPath, "")
+		provider.DefaultRoot+provider.CallbackPath, "")
 	u := provider.oAuthConfig.AuthCodeURL(state)
 	http.Redirect(w, r, u, http.StatusTemporaryRedirect)
 	return nil
