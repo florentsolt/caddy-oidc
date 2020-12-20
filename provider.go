@@ -42,21 +42,23 @@ type Endpoints struct {
 }
 
 type Provider struct {
-	ClientID           string    `json:"client_id"`
-	ClientSecret       string    `json:"client_secret"`
-	Scopes             []string  `json:"scopes"`
-	Endpoints          Endpoints `json:"endpoints"`
-	URL                string    `json:"provider"`
-	CookiePath         string    `json:"cookie_path"`
-	CookieNameKey      string    `json:"cookie_name_key"`
-	CookieNameProvider string    `json:"cookie_name_provider"`
-	CookieNameState    string    `json:"cookie_name_state"`
-	CookieNameRedirect string    `json:"cookie_name_redirect"`
-	LoginPath          string    `json:"login_path"`
-	LogoutPath         string    `json:"logout_path"`
-	CallbackPath       string    `json:"callback_path"`
-	LogoutRedirect     string    `json:"logout_redirect"`
-	DefaultRoot        string    `json:"default_root"`
+	ClientID            string    `json:"client_id"`
+	ClientSecret        string    `json:"client_secret"`
+	Scopes              []string  `json:"scopes"`
+	Endpoints           Endpoints `json:"endpoints"`
+	URL                 string    `json:"provider"`
+	CookiePath          string    `json:"cookie_path"`
+	CookieNameKey       string    `json:"cookie_name_key"`
+	CookieNameProvider  string    `json:"cookie_name_provider"`
+	CookieNameState     string    `json:"cookie_name_state"`
+	CookieNameRedirect  string    `json:"cookie_name_redirect"`
+	LoginPath           string    `json:"login_path"`
+	LogoutPath          string    `json:"logout_path"`
+	CallbackPath        string    `json:"callback_path"`
+	LogoutRedirect      string    `json:"logout_redirect"`
+	DefaultRoot         string    `json:"default_root"`
+	LazyLoad            bool      `json:"lazy_load"`
+	RemoteConfigTimeout string    `json:"remote_config_timeout"`
 
 	logger      *zap.Logger
 	oAuthConfig *oauth2.Config
@@ -76,16 +78,24 @@ var ErrUnableToGetProviderConfig = errors.New("Unable to get provider config")
 
 const ProviderUrlSuffix = "/.well-known/openid-configuration"
 
-func (provider *Provider) Provision(ctx caddy.Context) error {
-	provider.logger = ctx.Logger(provider)
-	provider.sessions = map[string]*Session{}
+func (provider *Provider) LoadRemoteConfig() error {
+	provider.mux.Lock()
+	defer provider.mux.Unlock()
 
-	client := new(http.Client)
 	url := provider.URL
 	if !strings.HasSuffix(url, ProviderUrlSuffix) {
 		url = strings.TrimSuffix(url, "/")
 		url += ProviderUrlSuffix
 	}
+	provider.logger.Info("loading remote config", zap.String("url", url))
+
+	client := new(http.Client)
+	duration, err := time.ParseDuration(provider.RemoteConfigTimeout)
+	if err != nil {
+		provider.logger.Error("unable to parse duration", zap.String("duration", provider.RemoteConfigTimeout), zap.Error(err))
+		duration = time.Second * 5
+	}
+	client.Timeout = duration
 	res, err := client.Get(url)
 	if err != nil {
 		provider.logger.Error(ErrUnableToGetProviderConfig.Error(), zap.Error(err))
@@ -105,6 +115,24 @@ func (provider *Provider) Provision(ctx caddy.Context) error {
 		provider.logger.Error(ErrUnableToGetProviderConfig.Error(), zap.Any("endpoints", provider.Endpoints))
 		return ErrUnableToGetProviderConfig
 	}
+	provider.oAuthConfig = &oauth2.Config{
+		ClientID:     provider.ClientID,
+		ClientSecret: provider.ClientSecret,
+		Scopes:       provider.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   provider.Endpoints.Authorization,
+			TokenURL:  provider.Endpoints.Token,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+	}
+
+	provider.LazyLoad = false
+	return nil
+}
+
+func (provider *Provider) Provision(ctx caddy.Context) error {
+	provider.logger = ctx.Logger(provider)
+	provider.sessions = map[string]*Session{}
 
 	if provider.LoginPath == "" {
 		provider.LoginPath = "{http.request.uri.path.dir}login"
@@ -121,7 +149,6 @@ func (provider *Provider) Provision(ctx caddy.Context) error {
 	if provider.DefaultRoot == "" {
 		provider.DefaultRoot = "{http.request.scheme}://{http.request.hostport}"
 	}
-
 	if provider.CookiePath == "" {
 		provider.CookiePath = "/"
 	}
@@ -138,15 +165,14 @@ func (provider *Provider) Provision(ctx caddy.Context) error {
 		provider.CookieNameRedirect = "_redirect"
 	}
 
-	provider.oAuthConfig = &oauth2.Config{
-		ClientID:     provider.ClientID,
-		ClientSecret: provider.ClientSecret,
-		Scopes:       provider.Scopes,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:   provider.Endpoints.Authorization,
-			TokenURL:  provider.Endpoints.Token,
-			AuthStyle: oauth2.AuthStyleInParams,
-		},
+	if provider.RemoteConfigTimeout == "" {
+		provider.RemoteConfigTimeout = "5s"
+	}
+	if !provider.LazyLoad {
+		if err := provider.LoadRemoteConfig(); err != nil {
+			provider.logger.Error("Unable to load remote config", zap.Error(err))
+			return err
+		}
 	}
 
 	if app, err := ctx.App("oidc"); err != nil {
@@ -230,6 +256,9 @@ func (provider *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.Args(&provider.CookieNameRedirect) {
 					return d.ArgErr()
 				}
+			case "lazy_load":
+				provider.LazyLoad = true
+
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())
 			}
@@ -249,9 +278,11 @@ func (provider *Provider) Sign(r *http.Request) ([]byte, error) {
 	io.WriteString(h, r.Header.Get("User-Agent"))
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return nil, errors.New("Unable to parse host:port from RemoteAddr")
+		return nil, errors.New("unable to parse host:port from RemoteAddr")
 	}
-	io.WriteString(h, ip)
+	if _, err := io.WriteString(h, ip); err != nil {
+		return nil, err
+	}
 	return h.Sum(nil), nil
 }
 
@@ -259,14 +290,16 @@ func (provider *Provider) RefreshUserInfo(session *Session) error {
 	client := provider.oAuthConfig.Client(context.TODO(), session.Token)
 	resp, err := client.Get(provider.Endpoints.UserInfo)
 	if err != nil || resp == nil {
-		return errors.New("Unable to get user info")
+		provider.logger.Error("unable to get user info", zap.Error(err))
+		return errors.New("unable to get user info")
 	}
 	if resp.StatusCode != 200 {
-		return errors.New("Unable to get user info")
+		provider.logger.Error("unable to get user info", zap.Int("status", resp.StatusCode))
+		return errors.New("unable to get user info")
 	}
 	defer resp.Body.Close()
 	if err := json.NewDecoder(resp.Body).Decode(&session.UserInfo); err != nil {
-		return errors.New("Unable to decode user info")
+		return errors.New("unable to decode user info")
 	}
 	return nil
 }
@@ -274,7 +307,7 @@ func (provider *Provider) RefreshUserInfo(session *Session) error {
 func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) (string, error) {
 	sign, err := provider.Sign(r)
 	if err != nil {
-		provider.logger.Error("Unable to sign request", zap.Error(err))
+		provider.logger.Error("unable to sign request", zap.Error(err))
 		return "", err
 	}
 	session := &Session{
@@ -282,10 +315,10 @@ func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) 
 		Token: token,
 	}
 	if err := provider.RefreshUserInfo(session); err != nil {
-		provider.logger.Error("Unable to refresh user info", zap.Error(err))
+		provider.logger.Error("unable to refresh user info", zap.Error(err))
 		return "", err
 	}
-	provider.logger.Info("Login", zap.Any("userinfo", session.UserInfo))
+	provider.logger.Info("login", zap.Any("userinfo", session.UserInfo))
 
 	var key string
 	provider.mux.Lock()
@@ -302,6 +335,13 @@ func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) 
 }
 
 func (provider *Provider) GetSession(r *http.Request) *Session {
+	if provider.LazyLoad {
+		if err := provider.LoadRemoteConfig(); err != nil {
+			provider.logger.Error("unable to load remote config", zap.Error(err))
+			return nil
+		}
+	}
+
 	id, err := r.Cookie(provider.CookieNameProvider)
 	if err != nil || id == nil || id.Value == "" {
 		return nil
@@ -332,7 +372,7 @@ func (provider *Provider) GetSession(r *http.Request) *Session {
 func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error {
 	state, err := r.Cookie(provider.CookieNameState)
 	if err != nil {
-		provider.logger.Error("Unable to find state", zap.Error(err))
+		provider.logger.Error("unable to find state", zap.Error(err))
 		w.WriteHeader(http.StatusForbidden)
 		return err
 	}
@@ -350,12 +390,12 @@ func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error
 
 	token, err := provider.oAuthConfig.Exchange(context.Background(), r.FormValue("code"))
 	if err != nil {
-		provider.logger.Error("Unable to exchange", zap.Error(err))
+		provider.logger.Error("unable to exchange", zap.Error(err))
 		return err
 	}
 	key, err := provider.RegisterSession(r, token)
 	if err != nil {
-		provider.logger.Error("Unable to register session", zap.Error(err))
+		provider.logger.Error("unable to register session", zap.Error(err))
 		return err
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -371,7 +411,7 @@ func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error
 
 	url, err := r.Cookie(provider.CookieNameRedirect)
 	if err != nil {
-		provider.logger.Error("Unable to find redirect url", zap.Error(err))
+		provider.logger.Error("unable to find redirect url", zap.Error(err))
 		w.WriteHeader(http.StatusForbidden)
 		return err
 	}
@@ -446,7 +486,7 @@ func (provider *Provider) Logout(w http.ResponseWriter, r *http.Request) error {
 	if provider.Endpoints.EndSession != "" {
 		u, err := url.Parse(provider.Endpoints.EndSession)
 		if err != nil {
-			provider.logger.Error("Unable to parse end session url", zap.Error(err))
+			provider.logger.Error("unable to parse end session url", zap.Error(err))
 			return err
 		}
 		q := u.Query()
@@ -462,6 +502,13 @@ func (provider *Provider) Logout(w http.ResponseWriter, r *http.Request) error {
 
 func (provider *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+
+	if provider.LazyLoad {
+		if err := provider.LoadRemoteConfig(); err != nil {
+			provider.logger.Error("unable to load remote config", zap.Error(err))
+			return err
+		}
+	}
 
 	switch r.URL.Path {
 	case repl.ReplaceKnown(provider.LoginPath, ""):

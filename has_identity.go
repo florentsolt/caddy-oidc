@@ -55,7 +55,6 @@ func (hasIdentity *HasIdentity) UnmarshalCaddyfile(d *caddyfile.Dispenser) error
 var reHeaderName = regexp.MustCompile(`[^\w\-_\d]+`)
 
 func (hasIdentity *HasIdentity) Match(r *http.Request) bool {
-
 	session := hasIdentity.app.GetSession(r)
 	if session == nil {
 		return false
