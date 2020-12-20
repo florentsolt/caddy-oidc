@@ -342,6 +342,24 @@ func (provider *Provider) GetSession(r *http.Request) *Session {
 		}
 	}
 
+	if r.Header.Get("Authorization") != "" {
+		split := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
+		token := &oauth2.Token{
+			AccessToken: split[1],
+			TokenType:   split[0],
+		}
+		session := &Session{
+			Token: token,
+		}
+		provider.logger.Info("Authorization", zap.Any("token", token))
+
+		if err := provider.RefreshUserInfo(session); err != nil {
+			provider.logger.Error("unable to refresh user info", zap.Error(err))
+			return nil
+		}
+		return session
+	}
+
 	id, err := r.Cookie(provider.CookieNameProvider)
 	if err != nil || id == nil || id.Value == "" {
 		return nil
