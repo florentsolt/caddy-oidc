@@ -68,6 +68,7 @@ func (app *App) GetSession(r *http.Request) (*Session, *Provider) {
 	for _, provider := range app.providers {
 		if session := provider.GetSession(r); session != nil {
 			if !session.Token.Expiry.IsZero() && session.Token.Expiry.Before(time.Now()) {
+				provider.DeleteSession(session)
 				return nil, nil
 			}
 			return session, provider

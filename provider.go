@@ -458,6 +458,16 @@ func (provider *Provider) GetSession(r *http.Request) *Session {
 	return session
 }
 
+func (provider *Provider) DeleteSession(session *Session) {
+	provider.mux.Lock()
+	defer provider.mux.Unlock()
+	for key := range provider.sessions {
+		if provider.sessions[key] == session {
+			delete(provider.sessions, key)
+		}
+	}
+}
+
 func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error {
 	state, err := r.Cookie(provider.CookieNameState)
 	if err != nil {
@@ -520,7 +530,7 @@ func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error
 func (provider *Provider) Login(w http.ResponseWriter, r *http.Request) error {
 	session := provider.GetSession(r)
 	if session != nil {
-		return nil
+		provider.DeleteSession(session)
 	}
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
