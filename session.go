@@ -1,39 +1,34 @@
 package caddyoidc
 
 import (
-	"context"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 
 	"golang.org/x/oauth2"
 )
 
 type Session struct {
-	Sign     []byte
-	Token    *oauth2.Token
-	UserInfo map[string]interface{}
+	Sign     []byte                 `json:"sign"`
+	Token    *oauth2.Token          `json:"token"`
+	UserInfo map[string]interface{} `json:"user_info"`
+	Claims   map[string]interface{} `json:"claims"`
 }
 
-func (s *Session) RefreshToken(config *oauth2.Config) error {
-	source := config.TokenSource(context.TODO(), s.Token)
-	token, err := source.Token()
-	if err != nil {
-		return err
+func (s *Session) Values() map[string]interface{} {
+	values := map[string]interface{}{}
+	for name, value := range s.UserInfo {
+		values["oidc.userinfo."+name] = value
 	}
-	s.Token = token
-	return nil
+	for name, value := range s.Claims {
+		values["oidc.claim."+name] = value
+	}
+	buf := new(bytes.Buffer)
+	json.NewEncoder(buf).Encode(s.UserInfo)
+	values["oidc.userinfo"] = base64.StdEncoding.EncodeToString(buf.Bytes())
+	buf.Reset()
+	json.NewEncoder(buf).Encode(s.Claims)
+	values["oidc.claims"] = base64.StdEncoding.EncodeToString(buf.Bytes())
+	values["oidc.authorization"] = s.Token.Type() + " " + s.Token.AccessToken
+	return values
 }
-
-// func (s *Session) RefreshUserInfo(url string, config *oauth2.Config) error {
-// 	client := config.Client(context.TODO(), s.Token)
-// 	resp, err := client.Get(url)
-// 	if err != nil || resp == nil {
-// 		return errors.New("Unable to get user info")
-// 	}
-// 	if resp.StatusCode != 200 {
-// 		return errors.New("Unable to get user info")
-// 	}
-// 	defer resp.Body.Close()
-// 	if err := json.NewDecoder(resp.Body).Decode(&s.UserInfo); err != nil {
-// 		return errors.New("Unable to decode user info")
-// 	}
-// 	return nil
-// }

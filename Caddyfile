@@ -2,7 +2,7 @@
     order oidc first 
 }
 
-:8000 {
+:80 {
     encode zstd gzip
 
     log {
@@ -24,12 +24,17 @@
         # /auth/login 
         # /auth/logout 
         # /auth/callback 
+        # /auth/debug
 
         oidc {
             client_id 115265533744-676e39ua99pnu896pjkcrfacab7qbdp7.apps.googleusercontent.com
             client_secret 9RkkZGgfKwCTfs5aQG1h2tLO
             scopes openid profile email
             provider https://accounts.google.com
+            oauth_validate_url https://www.googleapis.com/oauth2/v3/tokeninfo
+            lazy_load
+            debug
+            user_info
         }
     }
 

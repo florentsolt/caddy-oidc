@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
@@ -61,15 +62,18 @@ func (app *App) RegisterProvider(provider *Provider) string {
 	return fmt.Sprintf("%x", id)
 }
 
-func (app *App) GetSession(r *http.Request) *Session {
+func (app *App) GetSession(r *http.Request) (*Session, *Provider) {
 	app.mux.RLock()
 	defer app.mux.RUnlock()
 	for _, provider := range app.providers {
 		if session := provider.GetSession(r); session != nil {
-			return session
+			if !session.Token.Expiry.IsZero() && session.Token.Expiry.Before(time.Now()) {
+				return nil, nil
+			}
+			return session, provider
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 var (

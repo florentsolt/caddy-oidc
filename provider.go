@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	oidc "github.com/coreos/go-oidc"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 )
@@ -42,22 +45,28 @@ type Endpoints struct {
 }
 
 type Provider struct {
+	*oidc.Provider
+
 	ClientID            string    `json:"client_id"`
 	ClientSecret        string    `json:"client_secret"`
 	Scopes              []string  `json:"scopes"`
 	Endpoints           Endpoints `json:"endpoints"`
+	OAuthValidateURL    string    `json:"oauth_validate_url"`
 	URL                 string    `json:"provider"`
 	CookiePath          string    `json:"cookie_path"`
 	CookieNameKey       string    `json:"cookie_name_key"`
 	CookieNameProvider  string    `json:"cookie_name_provider"`
 	CookieNameState     string    `json:"cookie_name_state"`
 	CookieNameRedirect  string    `json:"cookie_name_redirect"`
+	DebugPath           string    `json:"debug_path"`
 	LoginPath           string    `json:"login_path"`
 	LogoutPath          string    `json:"logout_path"`
 	CallbackPath        string    `json:"callback_path"`
 	LogoutRedirect      string    `json:"logout_redirect"`
 	DefaultRoot         string    `json:"default_root"`
 	LazyLoad            bool      `json:"lazy_load"`
+	Debug               bool      `json:"debug"`
+	UserInfo            bool      `json:"user_info"`
 	RemoteConfigTimeout string    `json:"remote_config_timeout"`
 
 	logger      *zap.Logger
@@ -65,6 +74,14 @@ type Provider struct {
 	sessions    map[string]*Session
 	mux         sync.RWMutex
 	id          string
+}
+
+func (provider *Provider) Values() map[string]interface{} {
+	return map[string]interface{}{
+		"oidc.provider.url":           provider.URL,
+		"oidc.provider.client_id":     provider.ClientID,
+		"oidc.provider.client_secret": provider.ClientSecret,
+	}
 }
 
 func (Provider) CaddyModule() caddy.ModuleInfo {
@@ -76,54 +93,27 @@ func (Provider) CaddyModule() caddy.ModuleInfo {
 
 var ErrUnableToGetProviderConfig = errors.New("Unable to get provider config")
 
-const ProviderUrlSuffix = "/.well-known/openid-configuration"
-
 func (provider *Provider) LoadRemoteConfig() error {
 	provider.mux.Lock()
 	defer provider.mux.Unlock()
 
-	url := provider.URL
-	if !strings.HasSuffix(url, ProviderUrlSuffix) {
-		url = strings.TrimSuffix(url, "/")
-		url += ProviderUrlSuffix
-	}
-	provider.logger.Info("loading remote config", zap.String("url", url))
+	provider.logger.Info("loading remote config", zap.String("url", provider.URL))
 
-	client := new(http.Client)
-	duration, err := time.ParseDuration(provider.RemoteConfigTimeout)
-	if err != nil {
-		provider.logger.Error("unable to parse duration", zap.String("duration", provider.RemoteConfigTimeout), zap.Error(err))
-		duration = time.Second * 5
+	if len(provider.Scopes) == 0 {
+		provider.Scopes = []string{"openid"}
 	}
-	client.Timeout = duration
-	res, err := client.Get(url)
+	p, err := oidc.NewProvider(context.TODO(), provider.URL)
 	if err != nil {
 		provider.logger.Error(ErrUnableToGetProviderConfig.Error(), zap.Error(err))
 		return ErrUnableToGetProviderConfig
 	}
-	if res.StatusCode != 200 {
-		provider.logger.Error(ErrUnableToGetProviderConfig.Error(), zap.Int("status", res.StatusCode))
-		return ErrUnableToGetProviderConfig
-	}
-	defer res.Body.Close()
-	if err := json.NewDecoder(res.Body).Decode(&provider.Endpoints); err != nil {
-		provider.logger.Error(ErrUnableToGetProviderConfig.Error(), zap.Error(err))
-		return ErrUnableToGetProviderConfig
-	}
-	if provider.Endpoints.Authorization == "" || provider.Endpoints.Token == "" ||
-		provider.Endpoints.UserInfo == "" {
-		provider.logger.Error(ErrUnableToGetProviderConfig.Error(), zap.Any("endpoints", provider.Endpoints))
-		return ErrUnableToGetProviderConfig
-	}
+	provider.Provider = p
+
 	provider.oAuthConfig = &oauth2.Config{
 		ClientID:     provider.ClientID,
 		ClientSecret: provider.ClientSecret,
 		Scopes:       provider.Scopes,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:   provider.Endpoints.Authorization,
-			TokenURL:  provider.Endpoints.Token,
-			AuthStyle: oauth2.AuthStyleInParams,
-		},
+		Endpoint:     provider.Endpoint(),
 	}
 
 	provider.LazyLoad = false
@@ -134,6 +124,9 @@ func (provider *Provider) Provision(ctx caddy.Context) error {
 	provider.logger = ctx.Logger(provider)
 	provider.sessions = map[string]*Session{}
 
+	if provider.DebugPath == "" {
+		provider.DebugPath = "{http.request.uri.path.dir}debug"
+	}
 	if provider.LoginPath == "" {
 		provider.LoginPath = "{http.request.uri.path.dir}login"
 	}
@@ -216,6 +209,10 @@ func (provider *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.Args(&provider.URL) {
 					return d.ArgErr()
 				}
+			case "debug_path":
+				if !d.Args(&provider.DebugPath) {
+					return d.ArgErr()
+				}
 			case "login_path":
 				if !d.Args(&provider.LoginPath) {
 					return d.ArgErr()
@@ -258,6 +255,15 @@ func (provider *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 			case "lazy_load":
 				provider.LazyLoad = true
+			case "user_info":
+				provider.UserInfo = true
+			case "debug":
+				provider.Debug = true
+
+			case "oauth_validate_url":
+				if !d.Args(&provider.OAuthValidateURL) {
+					return d.ArgErr()
+				}
 
 			default:
 				return d.Errf("unknown subdirective '%s'", d.Val())
@@ -287,28 +293,86 @@ func (provider *Provider) Sign(r *http.Request) ([]byte, error) {
 }
 
 func (provider *Provider) RefreshUserInfo(session *Session) error {
-	client := provider.oAuthConfig.Client(context.TODO(), session.Token)
-	resp, err := client.Get(provider.Endpoints.UserInfo)
-	if err != nil || resp == nil {
+	verifier := provider.Verifier(&oidc.Config{ClientID: provider.ClientID})
+	rawIDToken, ok := session.Token.Extra("id_token").(string)
+	if ok {
+		// try to validate id_token
+		idToken, err := verifier.Verify(context.TODO(), rawIDToken)
+		if err != nil {
+			provider.logger.Error("unable to verify id_token", zap.Error(err))
+			return err
+		}
+		if err := idToken.Claims(&session.Claims); err != nil {
+			provider.logger.Error("unable to extract claims", zap.Error(err))
+			return err
+		}
+	} else if provider.OAuthValidateURL != "" {
+		// try with the custom url
+		client := provider.oAuthConfig.Client(context.TODO(), session.Token)
+		res, err := client.Get(provider.OAuthValidateURL)
+		if err != nil {
+			provider.logger.Error("unable to validate token", zap.Error(err))
+			return err
+		}
+		defer res.Body.Close()
+		if res.StatusCode != 200 {
+			provider.logger.Error("unable to validate token", zap.Int("status", res.StatusCode))
+			return errors.New("unable to validate token")
+		}
+		if err := json.NewDecoder(res.Body).Decode(&session.Claims); err != nil {
+			provider.logger.Error("unable to decode validation respsonse", zap.Error(err))
+			return err
+		}
+	} else {
+		// try to get claims from access_token
+		idToken, err := verifier.Verify(context.TODO(), session.Token.AccessToken)
+		if err != nil {
+			provider.logger.Error("unable to verify access_token", zap.Error(err))
+			session.Claims = nil
+			return err
+		}
+		if err := idToken.Claims(&session.Claims); err != nil {
+			provider.logger.Error("unable to extract claims from access_token", zap.Error(err))
+			return err
+		}
+	}
+	provider.logger.Info("refresh", zap.Any("claims", session.Claims))
+
+	if !provider.UserInfo {
+		return nil
+	}
+	userinfo, err := provider.Provider.UserInfo(context.TODO(), provider.oAuthConfig.TokenSource(context.TODO(), session.Token))
+	if err != nil {
 		provider.logger.Error("unable to get user info", zap.Error(err))
-		return errors.New("unable to get user info")
+		return err
 	}
-	if resp.StatusCode != 200 {
-		provider.logger.Error("unable to get user info", zap.Int("status", resp.StatusCode))
-		return errors.New("unable to get user info")
-	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(&session.UserInfo); err != nil {
+	if err := userinfo.Claims(&session.UserInfo); err != nil {
 		return errors.New("unable to decode user info")
 	}
+
+	// client := provider.oAuthConfig.Client(context.TODO(), session.Token)
+	// resp, err := client.Get(provider.Endpoints.UserInfo)
+	// if err != nil || resp == nil {
+	// 	provider.logger.Error("unable to get user info", zap.Error(err))
+	// 	return errors.New("unable to get user info")
+	// }
+	// if resp.StatusCode != 200 {
+	// 	provider.logger.Error("unable to get user info", zap.Int("status", resp.StatusCode))
+	// 	return errors.New("unable to get user info")
+	// }
+	// defer resp.Body.Close()
+	// if err := json.NewDecoder(resp.Body).Decode(&session.UserInfo); err != nil {
+	// 	return errors.New("unable to decode user info")
+	// }
+	provider.logger.Info("refresh", zap.Any("userinfo", session.UserInfo))
 	return nil
 }
 
-func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) (string, error) {
+func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) (string, *Session, error) {
 	sign, err := provider.Sign(r)
 	if err != nil {
 		provider.logger.Error("unable to sign request", zap.Error(err))
-		return "", err
+		return "", nil, err
 	}
 	session := &Session{
 		Sign:  sign,
@@ -316,9 +380,8 @@ func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) 
 	}
 	if err := provider.RefreshUserInfo(session); err != nil {
 		provider.logger.Error("unable to refresh user info", zap.Error(err))
-		return "", err
+		return "", nil, err
 	}
-	provider.logger.Info("login", zap.Any("userinfo", session.UserInfo))
 
 	var key string
 	provider.mux.Lock()
@@ -331,7 +394,7 @@ func (provider *Provider) RegisterSession(r *http.Request, token *oauth2.Token) 
 		break
 	}
 	provider.mux.Unlock()
-	return key, nil
+	return key, session, nil
 }
 
 func (provider *Provider) GetSession(r *http.Request) *Session {
@@ -343,18 +406,26 @@ func (provider *Provider) GetSession(r *http.Request) *Session {
 	}
 
 	if r.Header.Get("Authorization") != "" {
+		// manualy build a token
 		split := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
 		token := &oauth2.Token{
 			AccessToken: split[1],
-			TokenType:   split[0],
+			TokenType:   strings.ToLower(split[0]),
 		}
-		session := &Session{
-			Token: token,
-		}
-		provider.logger.Info("Authorization", zap.Any("token", token))
 
-		if err := provider.RefreshUserInfo(session); err != nil {
-			provider.logger.Error("unable to refresh user info", zap.Error(err))
+		// search in existing sessions
+		provider.mux.RLock()
+		for _, existing := range provider.sessions {
+			if existing.Token.AccessToken == token.AccessToken && existing.Token.Type() == token.Type() {
+				provider.mux.RUnlock()
+				return existing
+			}
+		}
+		provider.mux.RUnlock()
+
+		_, session, err := provider.RegisterSession(r, token)
+		if err != nil {
+			provider.logger.Error("unable to validate session", zap.Error(err))
 			return nil
 		}
 		return session
@@ -402,8 +473,8 @@ func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error
 	})
 
 	if r.FormValue("state") != state.Value {
-		provider.logger.Error("Invalid oauth state")
-		return errors.New("Invalid oauth state")
+		provider.logger.Error("invalid oauth state")
+		return errors.New("invalid oauth state")
 	}
 
 	token, err := provider.oAuthConfig.Exchange(context.Background(), r.FormValue("code"))
@@ -411,7 +482,8 @@ func (provider *Provider) Callback(w http.ResponseWriter, r *http.Request) error
 		provider.logger.Error("unable to exchange", zap.Error(err))
 		return err
 	}
-	key, err := provider.RegisterSession(r, token)
+
+	key, _, err := provider.RegisterSession(r, token)
 	if err != nil {
 		provider.logger.Error("unable to register session", zap.Error(err))
 		return err
@@ -454,6 +526,7 @@ func (provider *Provider) Login(w http.ResponseWriter, r *http.Request) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	expiration := time.Now().Add(20 * time.Minute)
+	// FIXME check if state cookie already exists
 	state := provider.RandString()
 	http.SetCookie(w, &http.Cookie{
 		Name:    provider.CookieNameState,
@@ -518,6 +591,74 @@ func (provider *Provider) Logout(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func (provider *Provider) DumpSession(w http.ResponseWriter, r *http.Request) error {
+	if !provider.Debug {
+		w.WriteHeader(403)
+		return nil
+	}
+	session := provider.GetSession(r)
+	if session == nil {
+		w.WriteHeader(404)
+		return nil
+	}
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+
+	format := "html"
+	if strings.HasPrefix(r.Header.Get("User-Agent"), "curl") {
+		format = "txt"
+	}
+	q := r.URL.Query()
+	if q.Get("format") != "" {
+		format = strings.ToLower(strings.TrimSpace(q.Get("format")))
+	}
+	values := session.Values()
+	names := []string{}
+	for name, value := range values {
+		names = append(names, name)
+		repl.Set(name, value)
+	}
+	for name, value := range provider.Values() {
+		values[name] = value
+		names = append(names, name)
+		repl.Set(name, value)
+	}
+	sort.Strings(names)
+	buf := new(bytes.Buffer)
+
+	switch format {
+	case "html":
+		w.Header().Add("Content-Type", "text/html")
+		w.WriteHeader(200)
+		buf.WriteString("<html><body><style>*{font-family: monospace; line-break: anywhere}\n table{border-collapse: collapse}\n table, tr, td{border: 1px solid lightgrey; padding: 5px}\n td{width: 50%}</style><table>\n")
+		for _, name := range names {
+			buf.WriteString("<tr>")
+			buf.WriteString("<td>" + html.EscapeString(name) + "</td>")
+			s, _ := repl.GetString(name)
+			buf.WriteString("<td>" + html.EscapeString(s) + "</td>")
+			buf.WriteString("</tr>\n")
+		}
+		buf.WriteString("</table></body></html>\n")
+
+	case "json":
+		json.NewEncoder(buf).Encode(values)
+
+	case "txt":
+		w.Header().Add("Content-Type", "text/plain")
+		w.WriteHeader(200)
+		for _, name := range names {
+			buf.WriteString(name + ":\n")
+			s, _ := repl.GetString(name)
+			buf.WriteString(s + "\n\n")
+		}
+
+	default:
+		w.WriteHeader(400)
+	}
+
+	buf.WriteTo(w)
+	return nil
+}
+
 func (provider *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
@@ -529,6 +670,8 @@ func (provider *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 	}
 
 	switch r.URL.Path {
+	case repl.ReplaceKnown(provider.DebugPath, ""):
+		return provider.DumpSession(w, r)
 	case repl.ReplaceKnown(provider.LoginPath, ""):
 		return provider.Login(w, r)
 	case repl.ReplaceKnown(provider.LogoutPath, ""):

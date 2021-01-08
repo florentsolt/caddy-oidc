@@ -11,6 +11,7 @@ require (
 	github.com/aws/aws-sdk-go v1.36.10 // indirect
 	github.com/caddyserver/caddy/v2 v2.2.3
 	github.com/caddyserver/xcaddy v0.1.6 // indirect
+	github.com/coreos/go-oidc v2.2.1+incompatible
 	github.com/dgraph-io/badger v1.6.2 // indirect
 	github.com/dgraph-io/badger/v2 v2.2007.2 // indirect
 	github.com/golang/snappy v0.0.2 // indirect
@@ -26,6 +27,7 @@ require (
 	github.com/nxadm/tail v1.4.5 // indirect
 	github.com/onsi/ginkgo v1.14.2 // indirect
 	github.com/onsi/gomega v1.10.4 // indirect
+	github.com/pquerna/cachecontrol v0.0.0-20201205024021-ac21108117ac // indirect
 	github.com/prometheus/client_golang v1.9.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/smallstep/certificates v0.15.5 // indirect

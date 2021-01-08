@@ -1,9 +1,6 @@
 package caddyoidc
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
@@ -55,19 +52,18 @@ func (hasIdentity *HasIdentity) UnmarshalCaddyfile(d *caddyfile.Dispenser) error
 var reHeaderName = regexp.MustCompile(`[^\w\-_\d]+`)
 
 func (hasIdentity *HasIdentity) Match(r *http.Request) bool {
-	session := hasIdentity.app.GetSession(r)
+	session, provider := hasIdentity.app.GetSession(r)
 	if session == nil {
 		return false
 	}
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	for name, value := range session.UserInfo {
-		repl.Set("oidc.userinfo."+name, value)
+	for name, value := range session.Values() {
+		repl.Set(name, value)
 	}
-	buf := new(bytes.Buffer)
-	json.NewEncoder(buf).Encode(session.UserInfo)
-	repl.Set("oidc.userinfo", base64.StdEncoding.EncodeToString(buf.Bytes()))
-	repl.Set("oidc.authorization", session.Token.Type()+" "+session.Token.AccessToken)
+	for name, value := range provider.Values() {
+		repl.Set(name, value)
+	}
 	return true
 }
 
