@@ -78,9 +78,16 @@ type Provider struct {
 
 func (provider *Provider) Values() map[string]interface{} {
 	return map[string]interface{}{
-		"oidc.provider.url":           provider.URL,
-		"oidc.provider.client_id":     provider.ClientID,
-		"oidc.provider.client_secret": provider.ClientSecret,
+		"provider.scopes":                  provider.Scopes,
+		"provider.url":                     provider.URL,
+		"provider.endpoints.authorization": provider.Endpoints.Authorization,
+		"provider.endpoints.Token":         provider.Endpoints.Token,
+		"provider.endpoints.UserInfo":      provider.Endpoints.UserInfo,
+		"provider.endpoints.Revocation":    provider.Endpoints.Revocation,
+		"provider.endpoints.EndSession":    provider.Endpoints.EndSession,
+		"oidc.provider.url":                provider.URL,
+		"oidc.provider.client_id":          provider.ClientID,
+		"oidc.provider.client_secret":      provider.ClientSecret,
 	}
 }
 
@@ -117,6 +124,19 @@ func (provider *Provider) LoadRemoteConfig() error {
 	}
 
 	provider.LazyLoad = false
+
+	wellKnown := strings.TrimSuffix(provider.URL, "/") + "/.well-known/openid-configuration"
+	req, err := http.Get(wellKnown)
+	if err != nil {
+		provider.logger.Error("unable to download remote config")
+		return err
+	}
+	defer req.Body.Close()
+	if err := json.NewDecoder(req.Body).Decode(&provider.Endpoints); err != nil {
+		provider.logger.Error("unable to download remote config")
+		return err
+	}
+	provider.logger.Info("endpoints", zap.Any("value", provider.Endpoints))
 	return nil
 }
 
